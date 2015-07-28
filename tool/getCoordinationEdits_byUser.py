@@ -99,6 +99,12 @@ from pycommon.util.util import *
 from pycommon.db.db import db
 
 import pickle, sys, codecs
+import operator
+
+if len(sys.argv) < 2:
+    print("Enter project name:")
+    for project in wiki_projects:
+        print("  %s" % (project))
 
 localDb = "reflex_relations_2014"
 remoteDb = "enwiki_p_local"
@@ -141,6 +147,7 @@ def getCoordinationEdits(row):
     """
 
     dependencies = {}
+    dep_by_user = {}
 
     # First, grab all the related pages and templates for this project.
     out("[%s] Fetching project-related pages, sub-pages, and talk pages" % (row["p_title"]))
@@ -249,6 +256,12 @@ def getCoordinationEdits(row):
                         dependencies[this_date] = []
                     dependencies[this_date].append("Group identification")
 
+                    if this_member_id not in dep_by_user:
+                        dep_by_user[this_member_id] = {}
+                    if this_date not in dep_by_user[this_member_id]:
+                        dep_by_user[this_member_id][this_date] = []
+                    dep_by_user[this_member_id][this_date].append("Group identification")
+
             # Once we've gone through the members and identified dependencies,
             # copy this_members to last_members, clear out this_members, and
             # update last_rev
@@ -316,34 +329,55 @@ def getCoordinationEdits(row):
     out("[%s] Group awareness - awareness of content under group scope" % (row["p_title"]))
     out("[%s] Fetching articles linked to on all project pages" % (row["p_title"]))
     # Distinct from the Group identification query, not limiting to any namespace
-    query = "SELECT * FROM coord_project_links WHERE cpl_page_id IN (%s) AND cpl_link_date >= '%s' GROUP BY cpl_link_page_text, cpl_link_date ORDER BY cpl_link_date ASC" % (",".join(map(str, project_page_ids + project_talk_page_ids)), ww_to_date(min_ww) + "000000")
-    lc = ldb.execute(query)
-    links = lc.fetchall()
 
-    pages_edited = {}
-    for link in links:
-        link_ww = date_to_ww(link["cpl_link_date"])
-        edit_weeks = [link_ww, link_ww+1, link_ww+2, link_ww+3]
-        #member_ids = merge_dicts(members_at[link_ww], members_at[link_ww+1], members_at[link_ww+2], members_at[link_ww+3]).values()
-
-        members_at_range = {}
-        for i in range(4):
-            if link_ww + i in members_at:
-                members_at_range = merge_dicts(members_at_range, members_at[link_ww + i])
-        member_ids = members_at_range.values()
-        if len(member_ids) == 0:
-            continue
-
-        # For whatever this link links to, any project member that makes a subsequent edit
-        # to the linked page indicates awareness.
-        query = "SELECT * FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id = %s AND rc_wikiweek IN (%s) GROUP BY rc_user_id, rc_page_id" % (",".join(map(str, member_ids)), link["cpl_link_page_id"], ",".join(map(str, edit_weeks)))
+    # We'll need to chunk the results of this to avoid tmp table failure, fetch 10000 at a time
+    chunk = 0
+    chunk_size = 10000
+    while True:
+        query = "SELECT * FROM coord_project_links WHERE cpl_page_id IN (%s) AND cpl_link_date >= '%s' GROUP BY cpl_link_page_text, cpl_link_date ORDER BY cpl_link_date ASC LIMIT %s,%s" % (",".join(map(str, project_page_ids + project_talk_page_ids)), ww_to_date(min_ww) + "000000", chunk, chunk_size)
         lc = ldb.execute(query)
-        edits = lc.fetchall()
-        for edit in edits:
-            edit_date = link["cpl_link_date"]
-            if edit_date not in dependencies:
-                dependencies[edit_date] = []
-            dependencies[edit_date].append("Group awareness")
+
+        if lc.rowcount == 0:
+            break
+        chunk = chunk + chunk_size
+
+        while True:
+            links = lc.fetchmany(1000)
+            if not links:
+                break
+
+            sys.stdout.write(".")
+
+            pages_edited = {}
+            for link in links:
+                link_ww = date_to_ww(link["cpl_link_date"])
+                edit_weeks = [link_ww, link_ww+1, link_ww+2, link_ww+3]
+                #member_ids = merge_dicts(members_at[link_ww], members_at[link_ww+1], members_at[link_ww+2], members_at[link_ww+3]).values()
+
+                members_at_range = {}
+                for i in range(4):
+                    if link_ww + i in members_at:
+                        members_at_range = merge_dicts(members_at_range, members_at[link_ww + i])
+                member_ids = members_at_range.values()
+                if len(member_ids) == 0:
+                    continue
+
+                # For whatever this link links to, any project member that makes a subsequent edit
+                # to the linked page indicates awareness.
+                query = "SELECT * FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id = %s AND rc_wikiweek IN (%s) GROUP BY rc_user_id, rc_page_id" % (",".join(map(str, member_ids)), link["cpl_link_page_id"], ",".join(map(str, edit_weeks)))
+                lc1 = ldb.execute(query)
+                edits = lc1.fetchall()
+                for edit in edits:
+                    edit_date = link["cpl_link_date"]
+                    if edit_date not in dependencies:
+                        dependencies[edit_date] = []
+                    dependencies[edit_date].append("Group awareness")
+
+                    if edit["rc_user_id"] not in dep_by_user:
+                        dep_by_user[edit["rc_user_id"]] = {}
+                    if edit_date not in dep_by_user[edit["rc_user_id"]]:
+                        dep_by_user[edit["rc_user_id"]][edit_date] = []
+                    dep_by_user[edit["rc_user_id"]][edit_date].append("Group awareness")
 
     print("\n\n")
 
@@ -363,6 +397,7 @@ def getCoordinationEdits(row):
     this_ww = min_ww
     while this_ww < max_ww:
         if len(members_at[this_ww]) == 0:
+            this_ww += 1
             continue
 
         # Find all user talk page edits by project members for the current week
@@ -372,22 +407,32 @@ def getCoordinationEdits(row):
         # Once we get all the user talk page edits by project members for the current
         # week, determine if there were any two users who both edited the same page
         conversations = {}
+        conv_by_user = {}
         for edit in edits:
             if edit["rc_page_id"] not in conversations:
-                conversations[edit["rc_page_id"]] = 1
+                conversations[edit["rc_page_id"]] = []
             else:
-                conversations[edit["rc_page_id"]] += 1
+                conversations[edit["rc_page_id"]].append(edit["rc_user_id"])
+            
 
         # Then, for every page that was edited more than once, add a Cultural awareness
         # dependency for this week for that number of edits (i.e., a page that was
         # only edited once, by one user doesn't indicate cultural awareness).
         # (see the GROUP MySQL statement above).
         for page in conversations:
-            if conversations[page] > 1:
+            if len(conversations[page]) > 1:
                 edit_date = ww_to_date(this_ww) + "000000"
                 if edit_date not in dependencies:
                     dependencies[edit_date] = []
                 dependencies[edit_date].append("Cultural awareness")
+
+                for uid in conversations[page]:
+                    if uid not in dep_by_user:
+                        dep_by_user[uid] = {}
+                    if edit_date not in dep_by_user[uid]:
+                        dep_by_user[uid][edit_date] = []
+                    dep_by_user[uid][edit_date].append("Cultural awareness")
+
 
         this_ww += 1
 
@@ -404,6 +449,7 @@ def getCoordinationEdits(row):
     this_ww = min_ww
     while this_ww < max_ww:
         if len(members_at[this_ww]) == 0:
+            this_ww += 1
             continue
 
         edit_weeks = [link_ww, link_ww-1, link_ww-2, link_ww-3]
@@ -425,6 +471,12 @@ def getCoordinationEdits(row):
                     dependencies[edit_date] = []
                 dependencies[edit_date].append("Social awareness")
 
+                if prior_edit["rc_user_id"] not in dep_by_user:
+                    dep_by_user[prior_edit["rc_user_id"]] = {}
+                if edit_date not in dep_by_user[prior_edit["rc_user_id"]]:
+                    dep_by_user[prior_edit["rc_user_id"]][edit_date] = []
+                dep_by_user[prior_edit["rc_user_id"]][edit_date].append("Social awareness")
+
         this_ww += 1
 
     print("\n\n")
@@ -439,6 +491,7 @@ def getCoordinationEdits(row):
     this_ww = min_ww
     while this_ww < max_ww:
         if len(members_at[this_ww]) == 0:
+            this_ww += 1
             continue
 
         query = "SELECT rc_user_id, rc_page_id, rc_edits, rc_wikiweek FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id IN (%s) AND rc_wikiweek = %s" % (",".join(map(str, members_at[this_ww].values())), ",".join(map(str, project_page_ids)), this_ww)
@@ -454,6 +507,12 @@ def getCoordinationEdits(row):
                     dependencies[edit_date] = []
                 dependencies[edit_date].append("Coordination activity")
 
+                if edit["rc_user_id"] not in dep_by_user:
+                    dep_by_user[edit["rc_user_id"]] = {}
+                if edit_date not in dep_by_user[edit["rc_user_id"]]:
+                    dep_by_user[edit["rc_user_id"]][edit_date] = []
+                dep_by_user[edit["rc_user_id"]][edit_date].append("Coordination activity")
+
         this_ww += 1
 
     print("\n\n")
@@ -468,6 +527,7 @@ def getCoordinationEdits(row):
     this_ww = min_ww
     while this_ww < max_ww:
         if len(members_at[this_ww]) == 0:
+            this_ww += 1
             continue
 
         query = "SELECT rc_user_id, rc_page_id, rc_edits, rc_wikiweek FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id IN (%s) AND rc_wikiweek = %s" % (",".join(map(str, members_at[this_ww].values())), ",".join(map(str, project_talk_page_ids)), this_ww)
@@ -482,6 +542,12 @@ def getCoordinationEdits(row):
                     dependencies[edit_date] = []
                 dependencies[edit_date].append("Social coordination")
 
+                if edit["rc_user_id"] not in dep_by_user:
+                    dep_by_user[edit["rc_user_id"]] = {}
+                if edit_date not in dep_by_user[edit["rc_user_id"]]:
+                    dep_by_user[edit["rc_user_id"]][edit_date] = []
+                dep_by_user[edit["rc_user_id"]][edit_date].append("Social coordination")
+
         this_ww += 1
 
     print ("\n\n")
@@ -491,11 +557,12 @@ def getCoordinationEdits(row):
     ##   project by group members, excluding Talk pages.
     ####
     out("[%s] Production activity - indicated by edits by project members to project-related articles" % (row["p_title"]))
-    out("[%s] Fetching member edits to project-related pages" % (row["p_title"]))
+    out("[%s] Fetching member edits to project-related pages (%s pages)" % (row["p_title"], len(scope_page_ids)))
 
     this_ww = min_ww
     while this_ww < max_ww:
         if len(members_at[this_ww]) == 0 or len(scope_page_ids) == 0:
+            this_ww += 1
             continue
 
         query = "SELECT rc_user_id, rc_page_id, rc_edits, rc_wikiweek FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id IN (%s) AND rc_wikiweek = %s" % (",".join(map(str, members_at[this_ww].values())), ",".join(map(str, scope_page_ids)), this_ww)
@@ -509,6 +576,12 @@ def getCoordinationEdits(row):
                     dependencies[edit_date] = []
                 dependencies[edit_date].append("Production activity")
 
+                if edit["rc_user_id"] not in dep_by_user:
+                    dep_by_user[edit["rc_user_id"]] = {}
+                if edit_date not in dep_by_user[edit["rc_user_id"]]:
+                    dep_by_user[edit["rc_user_id"]][edit_date] = []
+                dep_by_user[edit["rc_user_id"]][edit_date].append("Production activity")
+
         this_ww += 1
 
     print("\n\n")
@@ -519,28 +592,39 @@ def getCoordinationEdits(row):
     ####
 
     out("[%s] Social production - indicated by member edits to Talk pages of project-related articles" % (row["p_title"]))
-    out("[%s] Fetching member edits to project-related Talk pages" % (row["p_title"]))
+    out("[%s] Fetching member talk page edits (%s pages) for weeks %s to %s, at: " % (row["p_title"], len(scope_talk_page_ids), min_ww, max_ww))
 
     this_ww = min_ww
     while this_ww < max_ww:
+        sys.stdout.write("%s, " % (this_ww))
+
         if len(members_at[this_ww]) == 0 or len(scope_talk_page_ids) == 0:
+            this_ww += 1
             continue
 
-        query = "SELECT rc_user_id, rc_page_id, rc_edits, rc_wikiweek FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id IN (%s) AND rc_wikiweek = %s" % (",".join(map(str, members_at[this_ww].values())), ",".join(map(str, scope_talk_page_ids)), this_ww)
-        lc = ldb.execute(query)
-        edits = lc.fetchall()
-        for edit in edits:
-            for i in range(edit["rc_edits"]):
-                edit_date = ww_to_date(edit["rc_wikiweek"]) + "000000"
-                if edit_date not in dependencies:
-                    dependencies[edit_date] = []
-                dependencies[edit_date].append("Social production")
+        for scope_talk_page_id in scope_talk_page_ids:
+            #query = "SELECT rc_user_id, rc_page_id, rc_edits, rc_wikiweek FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id IN (%s) AND rc_wikiweek = %s" % (",".join(map(str, members_at[this_ww].values())), ",".join(map(str, scope_talk_page_ids)), this_ww)
+            query = "SELECT rc_user_id, rc_page_id, rc_edits, rc_wikiweek FROM reflex_cache WHERE rc_user_id IN (%s) AND rc_page_id IN (%s) AND rc_wikiweek = %s" % (",".join(map(str, members_at[this_ww].values())), scope_talk_page_id, this_ww)
+            lc = ldb.execute(query)
+            edits = lc.fetchall()
+            for edit in edits:
+                for i in range(edit["rc_edits"]):
+                    edit_date = ww_to_date(edit["rc_wikiweek"]) + "000000"
+                    if edit_date not in dependencies:
+                        dependencies[edit_date] = []
+                    dependencies[edit_date].append("Social production")
+
+                    if edit["rc_user_id"] not in dep_by_user:
+                        dep_by_user[edit["rc_user_id"]] = {}
+                    if edit_date not in dep_by_user[edit["rc_user_id"]]:
+                        dep_by_user[edit["rc_user_id"]][edit_date] = []
+                    dep_by_user[edit["rc_user_id"]][edit_date].append("Social production")
 
         this_ww += 1
 
 
     # Once we're done, save the dependency data in a .csv file
-    csv = "dependency_trajectories_1_%s.csv" % (row["p_title"])
+    csv = "dependency_trajectories_2_%s.csv" % (row["p_title"])
     f = codecs.open(csv, "w", encoding="utf-8")
 
     # Make sure we're printing dates chronologically
@@ -549,9 +633,31 @@ def getCoordinationEdits(row):
     for date in dates:
         for dependency in dependencies[date]:
             f.write(str(date) + "," + dependency + "\n")
-
-    # That /should/ be it
     f.close()
+
+    pickle_struc(f="dep_by_user_%s.dat" % (row["p_title"]), d=dep_by_user)
+
+    # Also, print out the dependency trajectory for the top 3 users for this project
+    top_users = {}
+    for uid in dep_by_user:
+        top_users[uid] = 0
+        for date in dep_by_user[uid]:
+            for dep in dep_by_user[uid][date]:
+                top_users[uid] += 1
+    # Then, grab the top users from top_users (value)
+    sorted_top_users = sorted(top_users.items(), key=operator.itemgetter(1))[::-1][:3]
+    for u in sorted_top_users:
+        uid = u[0]
+        csv = "dependency_trajectories_2_%s_%s.csv" % (uid, row["p_title"])
+        f = codecs.open(csv, "w", encoding="utf-8")
+
+        # Make sure we're printing dates chronologically
+        dates = dep_by_user[uid].keys()
+        dates.sort()
+        for date in dates:
+            for dependency in dependencies[date]:
+                f.write(str(date) + "," + dependency + "\n")
+        f.close()
 
 
 def getMemberId(member):
@@ -590,8 +696,12 @@ def main():
     lc = ldb.execute(query)
     rows = lc.fetchall()
     for row in rows:
-        if row["p_title"] != "WikiProject_Copyright_Cleanup":
+        #if row["p_title"] != "WikiProject_Copyright_Cleanup":
+        if row["p_title"] != sys.argv[1]:
             continue
+
+        #print(sys.argv[1])
+        #sys.exit(0)
 
         getCoordinationEdits(row)
 
